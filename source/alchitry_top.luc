@@ -5,66 +5,165 @@ module alchitry_top (
     input usb_rx,           // USB->Serial input
     output usb_tx           // USB->Serial output
 ) {
-    
+
     sig rst
-    
+
     .clk(clk) {
         reset_conditioner reset_cond
-        
+
         #BAUD(115_200), #CLK_FREQ(100_000_000) {
             uart_rx rx
             uart_tx tx
         }
-        
+
         .rst(rst) {
             dff tx_data[8]
             dff tx_pending
-            dff got_line
             dff newline_pending
+
+            dff address[16]          // last complete address received
+            dff parse_address[16]    // address being assembled
+            dff addr_nibble[3]       // 0..4 hex digits received
+            dff parsing_address
+
+            dff reply_address[16]    // address being returned over UART
+            dff reply_pending
+            dff reply_index[4]       // character index in ADDR=xxxx CR/LF
         }
     }
-    
+
     always {
         reset_cond.in = ~rst_n
         rst = reset_cond.out
-        
+
         rx.rst = rst
         tx.rst = rst
-        
-        led = 8h00
-        led[0] = got_line.q
-        
+
+        // Show the upper byte of the last COMPLETE address.
+        led = address.q[15:8]
+
         // UART input
         rx.rx = usb_rx
-        
+
         // Default transmitter inputs
         tx.data = tx_data.q
         tx.new_data = 0
-        
-        // When RX gets a character, save it
+
+        // When RX gets a character, save/parse it.
         if (rx.new_data) {
-            if (rx.data == 8h0D) {
-                got_line.d = 1
+            if (rx.data == 8h0D) {                 // CR = end of command
                 tx_data.d = 8h0D
                 tx_pending.d = 1
                 newline_pending.d = 1
-            } else if (rx.data != 8h0A){
+
+                // Only commit and reply to a fully received Axxxx / axxxx command.
+                if (parsing_address.q && addr_nibble.q == 4) {
+                    address.d = parse_address.q
+                    reply_address.d = parse_address.q
+                    reply_pending.d = 1
+                    reply_index.d = 0
+                }
+
+                // CR always ends the current parse attempt.
+                parsing_address.d = 0
+                addr_nibble.d = 0
+
+            } else if (rx.data != 8h0A) {          // ignore incoming LF
+                // Echo normal characters.
                 tx_data.d = rx.data
                 tx_pending.d = 1
+
+                // Start an address command with either 'A' or 'a'.
+                if (!parsing_address.q &&
+                    (rx.data == 8h41 || rx.data == 8h61)) {
+                    parsing_address.d = 1
+                    addr_nibble.d = 0
+                    parse_address.d = 0
+
+                } else if (parsing_address.q && addr_nibble.q < 4) {
+                    // ASCII '0'..'9'
+                    if (rx.data >= 8h30 && rx.data <= 8h39) {
+                        parse_address.d = (parse_address.q << 4) | (rx.data - 8h30)
+                        addr_nibble.d = addr_nibble.q + 1
+
+                    // ASCII 'A'..'F'
+                    } else if (rx.data >= 8h41 && rx.data <= 8h46) {
+                        parse_address.d = (parse_address.q << 4) | (rx.data - 8h37)
+                        addr_nibble.d = addr_nibble.q + 1
+
+                    // ASCII 'a'..'f'
+                    } else if (rx.data >= 8h61 && rx.data <= 8h66) {
+                        parse_address.d = (parse_address.q << 4) | (rx.data - 8h57)
+                        addr_nibble.d = addr_nibble.q + 1
+
+                    // Any other character cancels the current command.
+                    } else {
+                        parsing_address.d = 0
+                        addr_nibble.d = 0
+                    }
+                }
             }
         }
-        
-        // When TX is ready, send saved character
+
+        // When TX is ready, send the saved character.
         if (tx_pending.q && !tx.busy) {
             tx.new_data = 1
             tx_pending.d = 0
-            if (newline_pending.q){
+
+            // Finish the echoed Enter with LF first.
+            if (newline_pending.q) {
                 tx_data.d = 8h0A
                 tx_pending.d = 1
                 newline_pending.d = 0
+
+            // Then return the complete parsed address as ADDR=xxxx CR/LF.
+            } else if (reply_pending.q) {
+                case (reply_index.q) {
+                    0: tx_data.d = 8h41 // A
+                    1: tx_data.d = 8h44 // D
+                    2: tx_data.d = 8h44 // D
+                    3: tx_data.d = 8h52 // R
+                    4: tx_data.d = 8h3D // =
+
+                    5:
+                        if (reply_address.q[15:12] < 10)
+                            tx_data.d = 8h30 + reply_address.q[15:12]
+                        else
+                            tx_data.d = 8h37 + reply_address.q[15:12]
+
+                    6:
+                        if (reply_address.q[11:8] < 10)
+                            tx_data.d = 8h30 + reply_address.q[11:8]
+                        else
+                            tx_data.d = 8h37 + reply_address.q[11:8]
+
+                    7:
+                        if (reply_address.q[7:4] < 10)
+                            tx_data.d = 8h30 + reply_address.q[7:4]
+                        else
+                            tx_data.d = 8h37 + reply_address.q[7:4]
+
+                    8:
+                        if (reply_address.q[3:0] < 10)
+                            tx_data.d = 8h30 + reply_address.q[3:0]
+                        else
+                            tx_data.d = 8h37 + reply_address.q[3:0]
+
+                    9: tx_data.d = 8h0D // CR
+                    10: tx_data.d = 8h0A // LF
+                    default: tx_data.d = 8h3F // ?
+                }
+
+                tx_pending.d = 1
+
+                if (reply_index.q == 10) {
+                    reply_pending.d = 0
+                } else {
+                    reply_index.d = reply_index.q + 1
+                }
             }
         }
-        
+
         usb_tx = tx.tx
     }
 }
