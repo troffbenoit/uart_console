@@ -2,6 +2,7 @@ module alchitry_top (
     input clk,              // 100MHz clock
     input rst_n,            // reset button (active low)
     output led[8],          // 8 user controllable LEDs
+    output io_led[3][8],
     input usb_rx,           // USB->Serial input
     output usb_tx           // USB->Serial output
 ) {
@@ -15,6 +16,7 @@ module alchitry_top (
             uart_rx rx
             uart_tx tx
         }
+
 
         .rst(rst) {
             dff tx_data[8]
@@ -35,6 +37,10 @@ module alchitry_top (
     always {
         reset_cond.in = ~rst_n
         rst = reset_cond.out
+
+        io_led[0] = address.q[7:0]
+        io_led[1] = address.q[15:8]
+        io_led[2] = 8h00
 
         rx.rst = rst
         tx.rst = rst
@@ -80,7 +86,7 @@ module alchitry_top (
                     addr_nibble.d = 0
                     parse_address.d = 0
 
-                } else if (parsing_address.q && addr_nibble.q < 4) {
+                } else if (parsing_address.q) {
                     // ASCII '0'..'9'
                     if (rx.data >= 8h30 && rx.data <= 8h39) {
                         parse_address.d = (parse_address.q << 4) | (rx.data - 8h30)
