@@ -174,6 +174,12 @@ module alchitry_top (
      */
     output io_select[4],
 
+    output br_rom_cs_n,
+    output br_ram_cs_n,
+    output br_uartb_cs_n,
+    output br_acia_cs_n,
+
+
     /*
      * usb_rx
      * ------
@@ -478,6 +484,22 @@ module alchitry_top (
         // Bank 2 is deliberately unused for now.
         io_led[2] = 8h00
 
+        // BR2 chip-select outputs default inactive.
+        // These signals are active LOW, so 1 means "not selected".
+        br_rom_cs_n = 1
+
+        if (address.q[15] == 1 ){
+            br_rom_cs_n =0
+        }
+
+        br_ram_cs_n = 1
+
+        if (address.q[15:13] == 3b000) {
+            br_ram_cs_n = 0
+        }
+
+        br_uartb_cs_n = 1
+        br_acia_cs_n = 1
 
         /*
          * ---------------------------------------------------------------------

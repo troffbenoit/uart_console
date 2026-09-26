@@ -42,6 +42,12 @@
                     "type": "Component",
                     "path": "Constraints/io_v2.acf"
                 }
+            },
+            {
+                "file": {
+                    "type": "DiskFile",
+                    "path": "constraint/br2.acf"
+                }
             }
         ],
         "ipCores": []
