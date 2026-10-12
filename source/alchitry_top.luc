@@ -5,462 +5,494 @@
  *
  * PURPOSE
  * -------
- * This FPGA design does four main jobs:
+ * This FPGA design performs six bounded, explicit jobs:
  *
- *   1. Listen for text arriving from the PC over USB/UART.
- *   2. Accept a command that looks like:
+ *   1. Receive bytes from the PC over USB/UART at 115200 baud.
+ *
+ *   2. Parse one address command in the form:
  *
  *          A5F9C
  *
- *      The first letter tells us "this is an address command".
- *      The next four characters are hexadecimal digits.
+ *      The leading A/a selects the address command and exactly four following
+ *      hexadecimal characters form a 16-bit address.
  *
- *   3. Save the completed 16-bit address inside the FPGA.
+ *   3. Commit only a complete, valid 16-bit address to the main address
+ *      register. Invalid or incomplete commands do not alter the last valid
+ *      address.
  *
- *   4. Show that address in several places:
+ *   4. Decode the stored address into active-low ROM, RAM, UART-B, and ACIA
+ *      chip-select outputs.
  *
- *          PC keyboard
- *              |
- *              v
- *        Python UART console
- *              |
- *              v
- *        USB serial connection
- *              |
- *              v
- *        FPGA UART receiver
- *              |
- *              v
- *        Axxxx command parser
- *              |
- *              v
- *        16-bit address register
- *          |         |          |
- *          |         |          |
- *          v         v          v
- *       UART      LED banks   4-digit
- *       reply                 display
+ *   5. Display the accepted address on the UART console, IO V2 LED banks,
+ *      the four-digit hexadecimal display, and selected Au V2 LEDs.
  *
+ *   6. Generate a 1 Hz BR2 heartbeat output so basic FPGA operation can be
+ *      verified independently of the address decoder.
+ *
+ * DATA FLOW
+ * ---------
+ *
+ *      PC keyboard
+ *          |
+ *          v
+ *      Python UART console
+ *          |
+ *          v
+ *      USB serial connection
+ *          |
+ *          v
+ *      FPGA UART receiver
+ *          |
+ *          v
+ *      Axxxx command parser
+ *          |
+ *          v
+ *      16-bit address register
+ *       |       |        |          |
+ *       v       v        v          v
+ *     UART    LEDs    7-segment   BR2 decode
+ *     reply                        outputs
  *
  * EXAMPLE
  * -------
- *
  * If the PC sends:
  *
- *          A5F9C<Enter>
+ *          A6000<Enter>
  *
- * the FPGA stores:
+ * the FPGA stores address 0x6000 and replies with:
  *
- *          address = 0x5F9C
+ *          ADDR=6000 MAP=ACIA
  *
- * then sends back:
+ * The MAP field is fixed at five characters so the reply state machine has a
+ * constant, explicitly bounded length. Short names are padded with spaces:
  *
- *          ADDR=5F9C
+ *          RAM__   -> 0x0000..0x1FFF
+ *          ACIA_   -> 0x6000..0x6FFF
+ *          UARTB   -> 0x7000..0x7FFF
+ *          ROM__   -> 0x8000..0xFFFF
+ *          NONE_   -> all currently unmapped addresses
  *
- * and displays:
+ * Underscores above represent transmitted spaces; underscores are not sent.
  *
- *          LED Bank 1 = 0x5F
- *          LED Bank 0 = 0x9C
- *          7-segment display = 5F9C
+ * DESIGN STYLE / NASA/JPL "POWER OF TEN" ADAPTATION
+ * -------------------------------------------------
+ * The original Power of Ten rules target software, especially C. Lucid HDL
+ * describes fixed hardware, so the rules are applied by intent rather than
+ * copied literally:
  *
+ *   1. Control flow is simple, explicit, and bounded.
+ *   2. There is no recursion or dynamically expanding behavior.
+ *   3. Parser loops are not used; command length is fixed at four hex digits.
+ *   4. State is explicit in fixed-width dff registers.
+ *   5. Counter widths and terminal counts are documented and bounded.
+ *   6. Combinational outputs receive deterministic defaults before overrides.
+ *   7. Invalid input is rejected rather than partially committed.
+ *   8. UART reply length and every valid reply_index value are explicit.
+ *   9. Signal names identify polarity where applicable (_n = active low).
+ *  10. Comments document assumptions, interfaces, boundaries, and invariants.
  *
- * DESIGN STYLE / "POWER OF TEN" IDEAS
- * -----------------------------------
- * The NASA/JPL "Power of Ten" rules were written for software, especially C.
- * Not every rule maps directly to FPGA hardware. This file follows the spirit
- * of the rules where they make sense for Lucid HDL:
- *
- *   - Keep control flow simple and easy to follow.
- *   - Use fixed-size hardware only.
- *   - No dynamic memory exists here.
- *   - No recursion exists here.
- *   - State is explicit in dff registers.
- *   - Counter widths are fixed and bounded.
- *   - Parser length is explicitly limited to four hexadecimal digits.
- *   - Outputs are always given deterministic values.
- *   - Invalid commands are rejected instead of partially accepted.
- *   - Hardware responsibilities are separated into small understandable jobs.
- *   - Comments explain assumptions, boundaries, and signal ownership.
- *
- * Think of the design as a group of tiny workers. Each worker has one job.
- * That is much easier to troubleshoot than one giant worker trying to do
- * everything at once.
+ * CHANGE NOTES - 2026-10-12
+ * -------------------------
+ *   - Preserved the hardware-verified 1 Hz heartbeat on BR2 B40.
+ *   - Renamed internal heartbeat state from obsolete kHz terminology.
+ *   - Extended the UART response with a fixed-width MAP field.
+ *   - Increased reply_index from four bits to five bits for indices 0..20.
+ *   - Documented memory-map ranges and active-low output defaults.
+ *   - Preserved the existing Axxxx parser and address-display behavior.
  * ============================================================================
  */
 
 module alchitry_top (
-    /*
-     * clk
-     * ---
-     * The main FPGA clock.
-     *
-     * It ticks 100,000,000 times every second.
-     *
-     * Almost everything inside this design moves forward one tiny step on
-     * each clock tick.
-     */    
-    input clk,
-    
-    /*
-     * rst_n
-     * -----
-     * Physical reset button.
-     *
-     * The "_n" means "active low".
-     *
-     * In plain English:
-     *
-     *     rst_n = 1  -> button not pressed
-     *     rst_n = 0  -> reset requested
-     */    
-    input rst_n,
-    
-    /*
-     * led[8]
-     * ------
-     * Eight LEDs built directly onto the Alchitry Au V2 board.
-     *
-     * We use these as another simple visual copy of the upper address byte.
-     */    
-    output led[8],
-    
-    /*
-     * io_led[3][8]
-     * ------------
-     * Three groups of eight LEDs on the Alchitry IO V2 board.
-     *
-     * There are 24 LEDs total:
-     *
-     *     io_led[0] -> Bank 0
-     *     io_led[1] -> Bank 1
-     *     io_led[2] -> Bank 2
-     *
-     * We currently use:
-     *
-     *     Bank 0 = low address byte
-     *     Bank 1 = high address byte
-     *     Bank 2 = unused / zero
-     */    
-    output io_led[3][8],
-    
-    /*
-     * io_segment[8]
-     * -------------
-     * The eight physical wires that control the seven-segment display:
-     *
-     *     seven normal segments + decimal point
-     *
-     * The IO V2 hardware is ACTIVE LOW.
-     *
-     * That means a physical segment turns ON when its output wire is 0.
-     */    
-    output io_segment[8],
-    
-    /*
-     * io_select[4]
-     * ------------
-     * Chooses which one of the four display digits is currently active.
-     *
-     * The display is multiplexed:
-     *
-     *     digit 0 on briefly
-     *     digit 1 on briefly
-     *     digit 2 on briefly
-     *     digit 3 on briefly
-     *     repeat very quickly
-     *
-     * Your eyes blend this together and it looks like all four digits are
-     * illuminated at the same time.
-     */    
-    output io_select[4],
-    
-    output br_rom_cs_n,
-    output br_ram_cs_n,
-    output br_uartb_cs_n,
-    output br_acia_cs_n,
-    output br_1khz,
-    
-    
-    /*
-     * usb_rx
-     * ------
-     * Serial data traveling:
-     *
-     *     PC -> FPGA
-     */    
-    input usb_rx,
-    
-    /*
-     * usb_tx
-     * ------
-     * Serial data traveling:
-     *
-     *     FPGA -> PC
-     */    
-    output usb_tx
-) {
-    
-    /*
-     * rst
-     * ---
-     * Clean internal reset signal produced by reset_conditioner.
-     */    
-    sig rst
-    
-    /*
-     * display_digit[2]
-     * ----------------
-     * A two-bit number can represent:
-     *
-     *     0, 1, 2, or 3
-     *
-     * Perfect for choosing one of four display digits.
-     */    
-    sig display_digit[2]
-    
-    /*
-     * display_value[4]
-     * ----------------
-     * The hexadecimal value currently being shown on ONE display digit.
-     *
-     * Four bits can represent:
-     *
-     *     0 through 15
-     *
-     * which is exactly:
-     *
-     *     0 1 2 3 4 5 6 7 8 9 A B C D E F
-     */    
-    sig display_value[4]
-    
-    /*
-     * display_segments[7]
-     * -------------------
-     * Logical ON/OFF pattern for the seven normal display segments.
-     *
-     * Decimal point is handled separately.
-     */    
-    sig display_segments[7]
-    
-    
-    /*
-     * =========================================================================
-     * CLOCKED HARDWARE BLOCKS
-     * =========================================================================
-     *
-     * Everything inside .clk(clk) is built around our 100 MHz clock.
-     */    
-    .clk(clk) {
-        
         /*
-         * reset_conditioner
+         * clk
+         * ---
+         * The main FPGA clock.
+         *
+         * It ticks 100,000,000 times every second.
+         *
+         * Almost everything inside this design moves forward one tiny step on
+         * each clock tick.
+         */    
+        input clk,
+
+        /*
+         * rst_n
+         * -----
+         * Physical reset button.
+         *
+         * The "_n" means "active low".
+         *
+         * In plain English:
+         *
+         *     rst_n = 1  -> button not pressed
+         *     rst_n = 0  -> reset requested
+         */    
+        input rst_n,
+
+        /*
+         * led[8]
+         * ------
+         * Eight LEDs built directly onto the Alchitry Au V2 board.
+         *
+         * We use these as another simple visual copy of the upper address byte.
+         */    
+        output led[8],
+
+        /*
+         * io_led[3][8]
+         * ------------
+         * Three groups of eight LEDs on the Alchitry IO V2 board.
+         *
+         * There are 24 LEDs total:
+         *
+         *     io_led[0] -> Bank 0
+         *     io_led[1] -> Bank 1
+         *     io_led[2] -> Bank 2
+         *
+         * We currently use:
+         *
+         *     Bank 0 = low address byte
+         *     Bank 1 = high address byte
+         *     Bank 2 = unused / zero
+         */    
+        output io_led[3][8],
+
+        /*
+         * io_segment[8]
+         * -------------
+         * The eight physical wires that control the seven-segment display:
+         *
+         *     seven normal segments + decimal point
+         *
+         * The IO V2 hardware is ACTIVE LOW.
+         *
+         * That means a physical segment turns ON when its output wire is 0.
+         */    
+        output io_segment[8],
+
+        /*
+         * io_select[4]
+         * ------------
+         * Chooses which one of the four display digits is currently active.
+         *
+         * The display is multiplexed:
+         *
+         *     digit 0 on briefly
+         *     digit 1 on briefly
+         *     digit 2 on briefly
+         *     digit 3 on briefly
+         *     repeat very quickly
+         *
+         * Your eyes blend this together and it looks like all four digits are
+         * illuminated at the same time.
+         */    
+        output io_select[4],
+
+        /*
+         * BR2 active-low memory-map outputs.
+         *
+         * A LOW level means the corresponding device is selected.
+         */
+        output br_rom_cs_n,
+        output br_ram_cs_n,
+        output br_uartb_cs_n,
+        output br_acia_cs_n,
+
+        /*
+         * BR2 hardware-alive heartbeat: 1 Hz square wave.
+         */
+        output br_1hz,
+
+
+        /*
+         * usb_rx
+         * ------
+         * Serial data traveling:
+         *
+         *     PC -> FPGA
+         */    
+        input usb_rx,
+
+        /*
+         * usb_tx
+         * ------
+         * Serial data traveling:
+         *
+         *     FPGA -> PC
+         */    
+        output usb_tx
+        ) {
+
+            /*
+             * rst
+             * ---
+             * Clean internal reset signal produced by reset_conditioner.
+             */    
+            sig rst
+
+                /*
+                 * display_digit[2]
+                 * ----------------
+                 * A two-bit number can represent:
+                 *
+                 *     0, 1, 2, or 3
+                 *
+                 * Perfect for choosing one of four display digits.
+                 */    
+                sig display_digit[2]
+
+                /*
+                 * display_value[4]
+                 * ----------------
+                 * The hexadecimal value currently being shown on ONE display digit.
+                 *
+                 * Four bits can represent:
+                 *
+                 *     0 through 15
+                 *
+                 * which is exactly:
+                 *
+                 *     0 1 2 3 4 5 6 7 8 9 A B C D E F
+                 */    
+                sig display_value[4]
+
+                /*
+                 * display_segments[7]
+                 * -------------------
+                 * Logical ON/OFF pattern for the seven normal display segments.
+                 *
+                 * Decimal point is handled separately.
+                 */    
+                sig display_segments[7]
+
+
+                /*
+                 * =========================================================================
+                 * CLOCKED HARDWARE BLOCKS
+                 * =========================================================================
+                 *
+                 * Everything inside .clk(clk) is built around our 100 MHz clock.
+                 */    
+                .clk(clk) {
+
+                    /*
+                     * reset_conditioner
+                     * -----------------
+                     * Mechanical buttons are noisy and asynchronous.
+                     *
+                     * This block turns the raw reset button into a clean reset signal that
+                     * is safe for the FPGA logic.
+                     */        
+                    reset_conditioner reset_cond
+
+                        /*
+                         * UART receiver and transmitter.
+                         *
+                         * BAUD = 115200 bits per second.
+                         * CLK_FREQ = 100 MHz FPGA clock.
+                         *
+                         * The library modules use those numbers to work out exactly when each
+                         * serial bit must be sampled or transmitted.
+                         */        
+#BAUD(115_200), #CLK_FREQ(100_000_000) {
+    uart_rx rx
+        uart_tx tx
+}
+
+/*
+ * =========================================================================
+ * STATE REGISTERS
+ * =========================================================================
+ *
+ * A dff is a flip-flop/register.
+ *
+ * Easy mental model:
+ *
+ *     .q = what the register contains RIGHT NOW
+ *     .d = what we want it to contain AFTER the next clock edge
+ *
+ * This explicit q/d style makes it easy to see what is current state
+ * and what is next state.
+ */        
+.rst(rst) {
+
+    /*
+     * tx_data
+     * -------
+     * One byte waiting to be handed to the UART transmitter.
+     */            
+    dff tx_data[8]
+
+        /*
+         * tx_pending
+         * ----------
+         * A one-bit flag.
+         *
+         * 1 means:
+         *
+         *     "There is a character waiting to be transmitted."
+         */            
+        dff tx_pending
+
+        /*
+         * newline_pending
+         * ---------------
+         * When the user presses Enter, the PC sends CR/LF.
+         *
+         * We echo CR first, then remember that LF still needs to be sent.
+         */            
+        dff newline_pending
+
+
+        /*
+         * address[16]
+         * -----------
+         * The LAST FULLY VALID 16-bit address received.
+         *
+         * IMPORTANT:
+         *
+         * This register changes ONLY when an entire valid Axxxx command
+         * has been received.
+         *
+         * Bad or incomplete commands do not change it.
+         */            
+        dff address[16]
+
+        /*
+         * parse_address[16]
          * -----------------
-         * Mechanical buttons are noisy and asynchronous.
+         * Scratchpad used while we are still receiving the four digits.
          *
-         * This block turns the raw reset button into a clean reset signal that
-         * is safe for the FPGA logic.
-         */        
-        reset_conditioner reset_cond
-        
+         * Example:
+         *
+         *     receive '5' -> 0x0005
+         *     receive 'F' -> 0x005F
+         *     receive '9' -> 0x05F9
+         *     receive 'C' -> 0x5F9C
+         */            
+        dff parse_address[16]
+
         /*
-         * UART receiver and transmitter.
+         * addr_nibble[3]
+         * --------------
+         * Counts how many hexadecimal digits have arrived.
          *
-         * BAUD = 115200 bits per second.
-         * CLK_FREQ = 100 MHz FPGA clock.
+         * We need exactly four.
          *
-         * The library modules use those numbers to work out exactly when each
-         * serial bit must be sampled or transmitted.
-         */        
-        #BAUD(115_200), #CLK_FREQ(100_000_000) {
-            uart_rx rx
-            uart_tx tx
-        }
-        
+         * Three bits are enough to hold the values 0 through 7.
+         */            
+        dff addr_nibble[3]
+
         /*
-         * =========================================================================
-         * STATE REGISTERS
-         * =========================================================================
+         * parsing_address
+         * ---------------
+         * 1 means:
          *
-         * A dff is a flip-flop/register.
+         *     "We already saw A/a and are now collecting four hex digits."
+         */            
+        dff parsing_address
+
+
+        /*
+         * reply_address[16]
+         * -----------------
+         * Frozen copy of the address being sent back to the PC.
          *
-         * Easy mental model:
+         * Keeping a separate reply copy makes the transmit process
+         * deterministic even if other logic changes later.
+         */            
+        dff reply_address[16]
+
+        /*
+         * reply_pending
+         * -------------
+         * 1 means a complete text reply still needs to be transmitted.
+         */            
+        dff reply_pending
+
+        /*
+         * reply_index[5]
+         * --------------
+         * Selects the next byte in the fixed-format reply:
          *
-         *     .q = what the register contains RIGHT NOW
-         *     .d = what we want it to contain AFTER the next clock edge
+         *     ADDR=xxxx MAP=yyyyy<CR><LF>
          *
-         * This explicit q/d style makes it easy to see what is current state
-         * and what is next state.
-         */        
-        .rst(rst) {
-            
-            /*
-             * tx_data
-             * -------
-             * One byte waiting to be handed to the UART transmitter.
-             */            
-            dff tx_data[8]
-            
-            /*
-             * tx_pending
-             * ----------
-             * A one-bit flag.
-             *
-             * 1 means:
-             *
-             *     "There is a character waiting to be transmitted."
-             */            
-            dff tx_pending
-            
-            /*
-             * newline_pending
-             * ---------------
-             * When the user presses Enter, the PC sends CR/LF.
-             *
-             * We echo CR first, then remember that LF still needs to be sent.
-             */            
-            dff newline_pending
-            
-            
-            /*
-             * address[16]
-             * -----------
-             * The LAST FULLY VALID 16-bit address received.
-             *
-             * IMPORTANT:
-             *
-             * This register changes ONLY when an entire valid Axxxx command
-             * has been received.
-             *
-             * Bad or incomplete commands do not change it.
-             */            
-            dff address[16]
-            
-            /*
-             * parse_address[16]
-             * -----------------
-             * Scratchpad used while we are still receiving the four digits.
-             *
-             * Example:
-             *
-             *     receive '5' -> 0x0005
-             *     receive 'F' -> 0x005F
-             *     receive '9' -> 0x05F9
-             *     receive 'C' -> 0x5F9C
-             */            
-            dff parse_address[16]
-            
-            /*
-             * addr_nibble[3]
-             * --------------
-             * Counts how many hexadecimal digits have arrived.
-             *
-             * We need exactly four.
-             *
-             * Three bits are enough to hold the values 0 through 7.
-             */            
-            dff addr_nibble[3]
-            
-            /*
-             * parsing_address
-             * ---------------
-             * 1 means:
-             *
-             *     "We already saw A/a and are now collecting four hex digits."
-             */            
-            dff parsing_address
-            
-            
-            /*
-             * reply_address[16]
-             * -----------------
-             * Frozen copy of the address being sent back to the PC.
-             *
-             * Keeping a separate reply copy makes the transmit process
-             * deterministic even if other logic changes later.
-             */            
-            dff reply_address[16]
-            
-            /*
-             * reply_pending
-             * -------------
-             * 1 means a complete text reply still needs to be transmitted.
-             */            
-            dff reply_pending
-            
-            /*
-             * reply_index[4]
-             * --------------
-             * Tells us which character of:
-             *
-             *     ADDR=xxxx<CR><LF>
-             *
-             * we are currently preparing.
-             *
-             * Positions:
-             *
-             *      0  A
-             *      1  D
-             *      2  D
-             *      3  R
-             *      4  =
-             *      5  first hex digit
-             *      6  second hex digit
-             *      7  third hex digit
-             *      8  fourth hex digit
-             *      9  CR
-             *     10  LF
-             */            
-            dff reply_index[4]
-            
-            
-            /*
-             * display_refresh[18]
-             * -------------------
-             * Free-running counter used only to refresh the four display digits.
-             *
-             * We use its upper two bits to choose one digit at a time.
-             *
-             * This is a fixed-width, bounded hardware counter.
-             */            
-            dff display_refresh[18]
-            
-            dff khz_counter[18]
-            dff khz_output
-        }
-    }
-    
-    
+         * Positions:
+         *      0..4   "ADDR="
+         *      5..8   four hexadecimal address digits
+         *      9      space
+         *     10..13  "MAP="
+         *     14..18  five-character memory-map name
+         *     19      CR
+         *     20      LF
+         *
+         * The five-character map field is fixed width and padded with spaces.
+         * Five index bits are required because the largest valid index is 20.
+         */
+        dff reply_index[5]
+
+
+        /*
+         * display_refresh[18]
+         * -------------------
+         * Free-running counter used only to refresh the four display digits.
+         *
+         * We use its upper two bits to choose one digit at a time.
+         *
+         * This is a fixed-width, bounded hardware counter.
+         */            
+        dff display_refresh[18]
+
+        /*
+         * heartbeat_counter[26]
+         * ---------------------
+         * Counts 0 through 49,999,999. With a 100 MHz input clock this is
+         * exactly 0.5 second. heartbeat_output toggles at each terminal count,
+         * therefore a complete high/low period is 1 second = 1 Hz.
+         *
+         * 26 bits are required because:
+         *     2^25 = 33,554,432  < 50,000,000
+         *     2^26 = 67,108,864  > 50,000,000
+         */
+        dff heartbeat_counter[26]
+
+        /* Stored state of the 1 Hz BR2 heartbeat output. */
+        dff heartbeat_output
+}
+}
+
+
+/*
+ * =========================================================================
+ * MAIN COMBINATIONAL LOGIC
+ * =========================================================================
+ *
+ * Lucid evaluates this block continuously.
+ *
+ * It describes:
+ *
+ *     - wiring
+ *     - next-state decisions
+ *     - output values
+ */    
+always {
+
     /*
-     * =========================================================================
-     * MAIN COMBINATIONAL LOGIC
-     * =========================================================================
+     * ---------------------------------------------------------------------
+     * RESET
+     * ---------------------------------------------------------------------
      *
-     * Lucid evaluates this block continuously.
-     *
-     * It describes:
-     *
-     *     - wiring
-     *     - next-state decisions
-     *     - output values
-     */    
-    always {
-        
-        /*
-         * ---------------------------------------------------------------------
-         * RESET
-         * ---------------------------------------------------------------------
-         *
-         * Physical reset is active low, so invert it before passing it into
-         * reset_conditioner.
-         */        
-        reset_cond.in = ~rst_n
-        
+     * Physical reset is active low, so invert it before passing it into
+     * reset_conditioner.
+     */        
+    reset_cond.in = ~rst_n
+
         /*
          * Use the clean conditioned reset everywhere else.
          */        
         rst = reset_cond.out
-        
-        
+
+
         /*
          * ---------------------------------------------------------------------
          * IO V2 LED BANKS
@@ -478,67 +510,89 @@ module alchitry_top (
          * [7:0] means "take the lowest eight bits".
          * [15:8] means "take the highest eight bits".
          */        
-        
+
         // Bank 0 shows the LOW byte.
         io_led[0] = address.q[7:0]
-        
+
         // Bank 1 shows the HIGH byte.
         io_led[1] = address.q[15:8]
-        
+
         // Bank 2 is deliberately unused for now.
         io_led[2] = 8h00
-        
-        // 1 kHz square wave from 100 MHz clock
-        khz_counter.d = khz_counter.q
-        khz_output.d = khz_output.q
 
-        if (khz_counter.q == 18d49999) {
-            khz_counter.d = 0
-            khz_output.d = ~khz_output.q
+        /*
+         * ---------------------------------------------------------------------
+         * 1 HZ BR2 HEARTBEAT
+         * ---------------------------------------------------------------------
+         *
+         * Hold the current state by default. At 49,999,999, reset the counter
+         * and toggle the stored output. The output therefore changes state once
+         * every 0.5 second and completes one full cycle every second.
+         */
+        heartbeat_counter.d = heartbeat_counter.q
+        heartbeat_output.d = heartbeat_output.q
+
+        if (heartbeat_counter.q == 26d49999999) {
+            heartbeat_counter.d = 0
+            heartbeat_output.d = ~heartbeat_output.q
         } else {
-        khz_counter.d = khz_counter.q + 1
-    }
-
-        br_1khz = khz_output.q
-        // These signals are active LOW, so 1 means "not selected".
-        br_rom_cs_n = 1
-        
-        if (address.q[15] == 1 ){
-            br_rom_cs_n =0
+            heartbeat_counter.d = heartbeat_counter.q + 1
         }
-        
+
+        br_1hz = heartbeat_output.q
+
+        /*
+         * ---------------------------------------------------------------------
+         * MEMORY-MAP CHIP SELECTS
+         * ---------------------------------------------------------------------
+         *
+         * All chip selects are active LOW:
+         *     0 = selected
+         *     1 = not selected
+         *
+         * Every output first receives a safe inactive default. The address
+         * comparisons below then assert only the matching region.
+         */
+        br_rom_cs_n = 1
         br_ram_cs_n = 1
-        
+        br_uartb_cs_n = 1
+        br_acia_cs_n = 1
+
+        /* ROM: 0x8000 through 0xFFFF. */
+        if (address.q[15] == 1) {
+            br_rom_cs_n = 0
+        }
+
+        /* RAM: 0x0000 through 0x1FFF. */
         if (address.q[15:13] == 3b000) {
             br_ram_cs_n = 0
         }
-        
-        br_uartb_cs_n = 1
 
+        /* UART-B: 0x7000 through 0x7FFF. */
         if (address.q[15:12] == 4h7) {
             br_uartb_cs_n = 0
         }
-        
-        br_acia_cs_n = 1
+
+        /* ACIA: 0x6000 through 0x6FFF. */
         if (address.q[15:12] == 4h6) {
             br_acia_cs_n = 0
         }
-        
-        /*
-         * ---------------------------------------------------------------------
-         * FOUR-DIGIT DISPLAY REFRESH
-         * ---------------------------------------------------------------------
-         *
-         * The display does NOT really drive all four digits simultaneously.
-         *
-         * We rapidly switch between them.
-         */        
-        
-        /*
-         * Increment the refresh counter every FPGA clock.
-         */        
-        display_refresh.d = display_refresh.q + 1
-        
+
+    /*
+     * ---------------------------------------------------------------------
+     * FOUR-DIGIT DISPLAY REFRESH
+     * ---------------------------------------------------------------------
+     *
+     * The display does NOT really drive all four digits simultaneously.
+     *
+     * We rapidly switch between them.
+     */        
+
+    /*
+     * Increment the refresh counter every FPGA clock.
+     */        
+    display_refresh.d = display_refresh.q + 1
+
         /*
          * Use the two upper counter bits as our digit number.
          *
@@ -550,8 +604,8 @@ module alchitry_top (
          *     11 -> digit 3
          */        
         display_digit = display_refresh.q[17:16]
-        
-        
+
+
         /*
          * Safe deterministic defaults.
          *
@@ -562,14 +616,14 @@ module alchitry_top (
          * Then override them only when necessary.
          */        
         display_value = 4h0
-        
+
         /*
          * 1111 means no digit selected because the IO V2 digit-select hardware
          * is active low.
          */        
         io_select = 4hF
-        
-        
+
+
         /*
          * Pick ONE nibble from the 16-bit address.
          *
@@ -582,7 +636,7 @@ module alchitry_top (
          *     [7:4]   = 9
          *     [3:0]   = C
          */        
-        
+
         /*
          * display_digit == 0
          *
@@ -590,113 +644,113 @@ module alchitry_top (
          */        
         if (display_digit == 0) {
             display_value = address.q[3:0]
-            
-            /*
-             * Active low:
-             *
-             * 1110 selects exactly one digit.
-             */            
-            io_select = 4b1110
-            
-        /*
-         * display_digit == 1
-         *
-         * Show the next digit moving left.
-         */            
+
+                /*
+                 * Active low:
+                 *
+                 * 1110 selects exactly one digit.
+                 */            
+                io_select = 4b1110
+
+                /*
+                 * display_digit == 1
+                 *
+                 * Show the next digit moving left.
+                 */            
         } else if (display_digit == 1) {
             display_value = address.q[7:4]
-            io_select = 4b1101
-            
-        /*
-         * display_digit == 2
-         */            
+                io_select = 4b1101
+
+                /*
+                 * display_digit == 2
+                 */            
         } else if (display_digit == 2) {
             display_value = address.q[11:8]
-            io_select = 4b1011
-            
-        /*
-         * The only remaining two-bit value is 3.
-         *
-         * Show the left-most digit.
-         */            
+                io_select = 4b1011
+
+                /*
+                 * The only remaining two-bit value is 3.
+                 *
+                 * Show the left-most digit.
+                 */            
         } else {
             display_value = address.q[15:12]
-            io_select = 4b0111
+                io_select = 4b0111
         }
-        
-        
+
+
+    /*
+     * ---------------------------------------------------------------------
+     * HEX VALUE -> SEVEN SEGMENTS
+     * ---------------------------------------------------------------------
+     *
+     * display_value contains one number from 0 to 15.
+     *
+     * We convert that number into the seven lines needed to draw the
+     * corresponding character.
+     *
+     * Bit order here is:
+     *
+     *     g f e d c b a
+     *
+     * The patterns below are LOGICAL active-high patterns.
+     *
+     * We invert them later because the actual IO V2 hardware is active low.
+     */        
+    case (display_value) {
+0:  display_segments = 7b0111111
+        1:  display_segments = 7b0000110
+        2:  display_segments = 7b1011011
+        3:  display_segments = 7b1001111
+        4:  display_segments = 7b1100110
+        5:  display_segments = 7b1101101
+        6:  display_segments = 7b1111101
+        7:  display_segments = 7b0000111
+        8:  display_segments = 7b1111111
+        9:  display_segments = 7b1101111
+
         /*
-         * ---------------------------------------------------------------------
-         * HEX VALUE -> SEVEN SEGMENTS
-         * ---------------------------------------------------------------------
+         * Hexadecimal letters.
          *
-         * display_value contains one number from 0 to 15.
-         *
-         * We convert that number into the seven lines needed to draw the
-         * corresponding character.
-         *
-         * Bit order here is:
-         *
-         *     g f e d c b a
-         *
-         * The patterns below are LOGICAL active-high patterns.
-         *
-         * We invert them later because the actual IO V2 hardware is active low.
-         */        
-        case (display_value) {
-            0:  display_segments = 7b0111111
-            1:  display_segments = 7b0000110
-            2:  display_segments = 7b1011011
-            3:  display_segments = 7b1001111
-            4:  display_segments = 7b1100110
-            5:  display_segments = 7b1101101
-            6:  display_segments = 7b1111101
-            7:  display_segments = 7b0000111
-            8:  display_segments = 7b1111111
-            9:  display_segments = 7b1101111
-                
-            /*
-             * Hexadecimal letters.
-             *
-             * Seven-segment displays cannot draw every capital letter nicely,
-             * so B and D are traditionally shown as lowercase-looking b and d.
-             */                
-            10: display_segments = 7b1110111 // A
-            11: display_segments = 7b1111100 // b
-            12: display_segments = 7b0111001 // C
-            13: display_segments = 7b1011110 // d
-            14: display_segments = 7b1111001 // E
-            15: display_segments = 7b1110001 // F
-                
-            /*
-             * Defensive fallback.
-             *
-             * display_value is only four bits, so normal hardware should never
-             * need this path. Keeping an explicit default makes intent clear.
-             */                
-            default: display_segments = 7b0000000
-        }
-        
-        
+         * Seven-segment displays cannot draw every capital letter nicely,
+         * so B and D are traditionally shown as lowercase-looking b and d.
+         */                
+        10: display_segments = 7b1110111 // A
+        11: display_segments = 7b1111100 // b
+        12: display_segments = 7b0111001 // C
+        13: display_segments = 7b1011110 // d
+        14: display_segments = 7b1111001 // E
+        15: display_segments = 7b1110001 // F
+
         /*
-         * The IO V2 segment lines are active low.
+         * Defensive fallback.
          *
-         * Therefore:
-         *
-         *     logical 1 -> physical 0 -> segment ON
-         *
-         * Invert our seven logical segment bits here at the hardware boundary.
-         */        
-        io_segment[6:0] = ~display_segments
-        
+         * display_value is only four bits, so normal hardware should never
+         * need this path. Keeping an explicit default makes intent clear.
+         */                
+        default: display_segments = 7b0000000
+    }
+
+
+    /*
+     * The IO V2 segment lines are active low.
+     *
+     * Therefore:
+     *
+     *     logical 1 -> physical 0 -> segment ON
+     *
+     * Invert our seven logical segment bits here at the hardware boundary.
+     */        
+    io_segment[6:0] = ~display_segments
+
         /*
          * Decimal point OFF.
          *
          * Active-low hardware means 1 = OFF.
          */        
         io_segment[7] = 1
-        
-        
+
+
         /*
          * ---------------------------------------------------------------------
          * UART RESET CONNECTIONS
@@ -704,8 +758,8 @@ module alchitry_top (
          */        
         rx.rst = rst
         tx.rst = rst
-        
-        
+
+
         /*
          * ---------------------------------------------------------------------
          * AU V2 ONBOARD LED DISPLAY
@@ -715,8 +769,8 @@ module alchitry_top (
          * Au V2 board.
          */        
         led = address.q[15:8]
-        
-        
+
+
         /*
          * ---------------------------------------------------------------------
          * UART RECEIVE WIRE
@@ -725,8 +779,8 @@ module alchitry_top (
          * Connect the physical PC->FPGA serial wire to the UART receiver.
          */        
         rx.rx = usb_rx
-        
-        
+
+
         /*
          * ---------------------------------------------------------------------
          * UART TRANSMITTER DEFAULTS
@@ -735,15 +789,15 @@ module alchitry_top (
          * tx_data.q is our saved outgoing byte.
          */        
         tx.data = tx_data.q
-        
+
         /*
          * Default to NOT starting a new transmission.
          *
          * We pulse this to 1 only when we are ready to send one byte.
          */        
         tx.new_data = 0
-        
-        
+
+
         /*
          * =========================================================================
          * UART COMMAND PARSER
@@ -767,7 +821,7 @@ module alchitry_top (
          * has arrived.
          */        
         if (rx.new_data) {
-            
+
             /*
              * -----------------------------------------------------------------
              * CARRIAGE RETURN = END OF COMMAND
@@ -776,59 +830,59 @@ module alchitry_top (
              * ASCII CR is hexadecimal 0D.
              */            
             if (rx.data == 8h0D) {
-                
+
                 /*
                  * Echo CR back to the PC.
                  */                
                 tx_data.d = 8h0D
-                tx_pending.d = 1
-                
-                /*
-                 * Remember that LF should be echoed after CR.
-                 */                
-                newline_pending.d = 1
-                
-                
-                /*
-                 * Commit the new address ONLY when:
-                 *
-                 *     1. We are really inside an address command.
-                 *     2. Exactly four hexadecimal digits were received.
-                 *
-                 * This is one of the most important validation checks in the
-                 * design.
-                 *
-                 * Examples:
-                 *
-                 *     A500A   -> valid
-                 *     A50     -> rejected
-                 *     A5000A  -> rejected
-                 */                
-                if (parsing_address.q && addr_nibble.q == 4) {
-                    
+                    tx_pending.d = 1
+
                     /*
-                     * Copy the completed scratchpad value into the official
-                     * address register.
-                     */                    
-                    address.d = parse_address.q
-                    
+                     * Remember that LF should be echoed after CR.
+                     */                
+                    newline_pending.d = 1
+
+
                     /*
-                     * Freeze the same value for the UART reply generator.
-                     */                    
-                    reply_address.d = parse_address.q
-                    
-                    /*
-                     * Tell the transmitter that a reply needs to be generated.
-                     */                    
-                    reply_pending.d = 1
-                    
-                    /*
-                     * Start reply generation from character zero.
-                     */                    
-                    reply_index.d = 0
-                }
-                
-                
+                     * Commit the new address ONLY when:
+                     *
+                     *     1. We are really inside an address command.
+                     *     2. Exactly four hexadecimal digits were received.
+                     *
+                     * This is one of the most important validation checks in the
+                     * design.
+                     *
+                     * Examples:
+                     *
+                     *     A500A   -> valid
+                     *     A50     -> rejected
+                     *     A5000A  -> rejected
+                     */                
+                    if (parsing_address.q && addr_nibble.q == 4) {
+
+                        /*
+                         * Copy the completed scratchpad value into the official
+                         * address register.
+                         */                    
+                        address.d = parse_address.q
+
+                            /*
+                             * Freeze the same value for the UART reply generator.
+                             */                    
+                            reply_address.d = parse_address.q
+
+                            /*
+                             * Tell the transmitter that a reply needs to be generated.
+                             */                    
+                            reply_pending.d = 1
+
+                            /*
+                             * Start reply generation from character zero.
+                             */                    
+                            reply_index.d = 0
+                    }
+
+
                 /*
                  * Enter ALWAYS finishes the current parse attempt.
                  *
@@ -836,230 +890,230 @@ module alchitry_top (
                  * command.
                  */                
                 parsing_address.d = 0
-                addr_nibble.d = 0
-                
-                
-            /*
-             * -----------------------------------------------------------------
-             * LINE FEED
-             * -----------------------------------------------------------------
-             *
-             * ASCII LF is 0A.
-             *
-             * The PC sends CR/LF when Enter is pressed.
-             *
-             * CR already ended the command, so incoming LF is ignored.
-             */                
+                    addr_nibble.d = 0
+
+
+                    /*
+                     * -----------------------------------------------------------------
+                     * LINE FEED
+                     * -----------------------------------------------------------------
+                     *
+                     * ASCII LF is 0A.
+                     *
+                     * The PC sends CR/LF when Enter is pressed.
+                     *
+                     * CR already ended the command, so incoming LF is ignored.
+                     */                
             } else if (rx.data != 8h0A) {
-                
+
                 /*
                  * Echo normal characters back to the PC.
                  *
                  * This lets the terminal show exactly what the FPGA received.
                  */                
                 tx_data.d = rx.data
-                tx_pending.d = 1
-                
-                
-                /*
-                 * -------------------------------------------------------------
-                 * BEGIN ADDRESS COMMAND
-                 * -------------------------------------------------------------
-                 *
-                 * ASCII:
-                 *
-                 *     'A' = 0x41
-                 *     'a' = 0x61
-                 *
-                 * We accept either uppercase or lowercase command letters.
-                 */                
-                if (!parsing_address.q &&
-                    (rx.data == 8h41 || rx.data == 8h61)) {
-                    
+                    tx_pending.d = 1
+
+
                     /*
-                     * We are now collecting the four address digits.
-                     */                    
-                    parsing_address.d = 1
-                    
-                    /*
-                     * No hexadecimal digits have been collected yet.
-                     */                    
-                    addr_nibble.d = 0
-                    
-                    /*
-                     * Clear the scratchpad before assembling the new address.
-                     */                    
-                    parse_address.d = 0
-                    
-                    
-                /*
-                 * -------------------------------------------------------------
-                 * RECEIVE ADDRESS DIGITS
-                 * -------------------------------------------------------------
-                 *
-                 * Once parsing has started, EVERY further non-LF character is
-                 * examined.
-                 *
-                 * This is intentional.
-                 *
-                 * After four valid digits, an extra fifth character will make
-                 * addr_nibble become greater than four. Then the command fails
-                 * the exact "== 4" validation test when CR arrives.
-                 */                    
-                } else if (parsing_address.q) {
-                    
-                    /*
-                     * ASCII '0' through '9'
+                     * -------------------------------------------------------------
+                     * BEGIN ADDRESS COMMAND
+                     * -------------------------------------------------------------
                      *
-                     *     '0' = 0x30
-                     *     '9' = 0x39
-                     */                    
-                    if (rx.data >= 8h30 && rx.data <= 8h39) {
-                        
-                        /*
-                         * Shift the old address left by four bits.
-                         *
-                         * This creates an empty hexadecimal digit on the right.
-                         *
-                         * Then OR in the numeric value of the new character.
-                         *
-                         * Example:
-                         *
-                         *     old value = 0x005F
-                         *     new char  = '9'
-                         *
-                         *     0x005F << 4 = 0x05F0
-                         *     '9' - '0'   = 9
-                         *     result      = 0x05F9
-                         */                        
-                        parse_address.d =
-                        (parse_address.q << 4) | (rx.data - 8h30)
-                        
-                        /*
-                         * Count this valid digit.
-                         */                        
-                        addr_nibble.d = addr_nibble.q + 1
-                        
-                        
-                    /*
-                     * ASCII uppercase 'A' through 'F'
+                     * ASCII:
                      *
                      *     'A' = 0x41
-                     *     'F' = 0x46
+                     *     'a' = 0x61
                      *
-                     * Subtracting 0x37 converts:
-                     *
-                     *     'A' -> 10
-                     *     'B' -> 11
-                     *     ...
-                     *     'F' -> 15
-                     */                        
-                    } else if (rx.data >= 8h41 && rx.data <= 8h46) {
-                        
-                        parse_address.d =
-                        (parse_address.q << 4) | (rx.data - 8h37)
-                        
-                        addr_nibble.d = addr_nibble.q + 1
-                        
-                        
-                    /*
-                     * ASCII lowercase 'a' through 'f'
-                     *
-                     * Subtracting 0x57 converts lowercase hex letters into
-                     * numeric values 10 through 15.
-                     */                        
-                    } else if (rx.data >= 8h61 && rx.data <= 8h66) {
-                        
-                        parse_address.d =
-                        (parse_address.q << 4) | (rx.data - 8h57)
-                        
-                        addr_nibble.d = addr_nibble.q + 1
-                        
-                        
-                    /*
-                     * Any other character invalidates the command immediately.
-                     *
-                     * Example:
-                     *
-                     *     A12G4
-                     *
-                     * G is not a hexadecimal digit, so stop parsing.
-                     */                        
-                    } else {
-                        parsing_address.d = 0
-                        addr_nibble.d = 0
+                     * We accept either uppercase or lowercase command letters.
+                     */                
+                    if (!parsing_address.q &&
+                            (rx.data == 8h41 || rx.data == 8h61)) {
+
+                        /*
+                         * We are now collecting the four address digits.
+                         */                    
+                        parsing_address.d = 1
+
+                            /*
+                             * No hexadecimal digits have been collected yet.
+                             */                    
+                            addr_nibble.d = 0
+
+                            /*
+                             * Clear the scratchpad before assembling the new address.
+                             */                    
+                            parse_address.d = 0
+
+
+                            /*
+                             * -------------------------------------------------------------
+                             * RECEIVE ADDRESS DIGITS
+                             * -------------------------------------------------------------
+                             *
+                             * Once parsing has started, EVERY further non-LF character is
+                             * examined.
+                             *
+                             * This is intentional.
+                             *
+                             * After four valid digits, an extra fifth character will make
+                             * addr_nibble become greater than four. Then the command fails
+                             * the exact "== 4" validation test when CR arrives.
+                             */                    
+                    } else if (parsing_address.q) {
+
+                        /*
+                         * ASCII '0' through '9'
+                         *
+                         *     '0' = 0x30
+                         *     '9' = 0x39
+                         */                    
+                        if (rx.data >= 8h30 && rx.data <= 8h39) {
+
+                            /*
+                             * Shift the old address left by four bits.
+                             *
+                             * This creates an empty hexadecimal digit on the right.
+                             *
+                             * Then OR in the numeric value of the new character.
+                             *
+                             * Example:
+                             *
+                             *     old value = 0x005F
+                             *     new char  = '9'
+                             *
+                             *     0x005F << 4 = 0x05F0
+                             *     '9' - '0'   = 9
+                             *     result      = 0x05F9
+                             */                        
+                            parse_address.d =
+                                (parse_address.q << 4) | (rx.data - 8h30)
+
+                                /*
+                                 * Count this valid digit.
+                                 */                        
+                                addr_nibble.d = addr_nibble.q + 1
+
+
+                                /*
+                                 * ASCII uppercase 'A' through 'F'
+                                 *
+                                 *     'A' = 0x41
+                                 *     'F' = 0x46
+                                 *
+                                 * Subtracting 0x37 converts:
+                                 *
+                                 *     'A' -> 10
+                                 *     'B' -> 11
+                                 *     ...
+                                 *     'F' -> 15
+                                 */                        
+                        } else if (rx.data >= 8h41 && rx.data <= 8h46) {
+
+                            parse_address.d =
+                                (parse_address.q << 4) | (rx.data - 8h37)
+
+                                addr_nibble.d = addr_nibble.q + 1
+
+
+                                /*
+                                 * ASCII lowercase 'a' through 'f'
+                                 *
+                                 * Subtracting 0x57 converts lowercase hex letters into
+                                 * numeric values 10 through 15.
+                                 */                        
+                        } else if (rx.data >= 8h61 && rx.data <= 8h66) {
+
+                            parse_address.d =
+                                (parse_address.q << 4) | (rx.data - 8h57)
+
+                                addr_nibble.d = addr_nibble.q + 1
+
+
+                                /*
+                                 * Any other character invalidates the command immediately.
+                                 *
+                                 * Example:
+                                 *
+                                 *     A12G4
+                                 *
+                                 * G is not a hexadecimal digit, so stop parsing.
+                                 */                        
+                        } else {
+                            parsing_address.d = 0
+                                addr_nibble.d = 0
+                        }
                     }
-                }
             }
         }
-        
-        
+
+
+    /*
+     * =========================================================================
+     * UART TRANSMIT STATE MACHINE
+     * =========================================================================
+     *
+     * tx_pending.q means:
+     *
+     *     "We have one byte waiting."
+     *
+     * tx.busy means:
+     *
+     *     "The UART transmitter is still sending the previous byte."
+     *
+     * We may start a new byte ONLY when:
+     *
+     *     tx_pending == 1
+     *     AND
+     *     tx.busy == 0
+     */        
+    if (tx_pending.q && !tx.busy) {
+
         /*
-         * =========================================================================
-         * UART TRANSMIT STATE MACHINE
-         * =========================================================================
+         * Pulse new_data for one cycle.
          *
-         * tx_pending.q means:
+         * This tells uart_tx:
          *
-         *     "We have one byte waiting."
-         *
-         * tx.busy means:
-         *
-         *     "The UART transmitter is still sending the previous byte."
-         *
-         * We may start a new byte ONLY when:
-         *
-         *     tx_pending == 1
-         *     AND
-         *     tx.busy == 0
-         */        
-        if (tx_pending.q && !tx.busy) {
-            
-            /*
-             * Pulse new_data for one cycle.
-             *
-             * This tells uart_tx:
-             *
-             *     "Please begin transmitting tx_data."
-             */            
-            tx.new_data = 1
-            
+         *     "Please begin transmitting tx_data."
+         */            
+        tx.new_data = 1
+
             /*
              * The current pending byte is now being consumed.
              */            
             tx_pending.d = 0
-            
-            
+
+
             /*
              * -----------------------------------------------------------------
              * ECHO LF AFTER CR
              * -----------------------------------------------------------------
              */            
             if (newline_pending.q) {
-                
+
                 /*
                  * Prepare LF.
                  */                
                 tx_data.d = 8h0A
-                
-                /*
-                 * Queue LF as the next byte.
-                 */                
-                tx_pending.d = 1
-                
-                /*
-                 * Only one LF is needed.
-                 */                
-                newline_pending.d = 0
-                
-                
-            /*
-             * -----------------------------------------------------------------
-             * SEND "ADDR=xxxx<CR><LF>"
-             * -----------------------------------------------------------------
-             */                
+
+                    /*
+                     * Queue LF as the next byte.
+                     */                
+                    tx_pending.d = 1
+
+                    /*
+                     * Only one LF is needed.
+                     */                
+                    newline_pending.d = 0
+
+
+                    /*
+                     * -----------------------------------------------------------------
+                     * SEND "ADDR=xxxx MAP=yyyyy<CR><LF>"
+                     * -----------------------------------------------------------------
+                     */                
             } else if (reply_pending.q) {
-                
+
                 /*
                  * reply_index chooses which byte to prepare next.
                  *
@@ -1067,106 +1121,181 @@ module alchitry_top (
                  * and bounded.
                  */                
                 case (reply_index.q) {
-                    
+
                     // "ADDR="
-                    0: tx_data.d = 8h41 // A
-                    1: tx_data.d = 8h44 // D
-                    2: tx_data.d = 8h44 // D
-                    3: tx_data.d = 8h52 // R
-                    4: tx_data.d = 8h3D // =
-                        
-                        
-                    /*
-                     * First hexadecimal digit: bits 15..12.
-                     *
-                     * Numeric values 0..9 become ASCII '0'..'9'.
-                     *
-                     * Values 10..15 become ASCII 'A'..'F'.
-                     */                        
-                    5:
-                        if (reply_address.q[15:12] < 10)
-                            tx_data.d = 8h30 + reply_address.q[15:12]
-                        else
-                            tx_data.d = 8h37 + reply_address.q[15:12]
-                        
-                        
-                    /*
-                     * Second hexadecimal digit: bits 11..8.
-                     */                        
-                    6:
-                        if (reply_address.q[11:8] < 10)
-                            tx_data.d = 8h30 + reply_address.q[11:8]
-                        else
-                            tx_data.d = 8h37 + reply_address.q[11:8]
-                        
-                        
-                    /*
-                     * Third hexadecimal digit: bits 7..4.
-                     */                        
-                    7:
-                        if (reply_address.q[7:4] < 10)
-                            tx_data.d = 8h30 + reply_address.q[7:4]
-                        else
-                            tx_data.d = 8h37 + reply_address.q[7:4]
-                        
-                        
-                    /*
-                     * Fourth hexadecimal digit: bits 3..0.
-                     */                        
-                    8:
-                        if (reply_address.q[3:0] < 10)
-                            tx_data.d = 8h30 + reply_address.q[3:0]
-                        else
-                            tx_data.d = 8h37 + reply_address.q[3:0]
-                        
-                        
-                    /*
-                     * Finish the reply with CR/LF.
-                     */                        
-                    9: tx_data.d = 8h0D // CR
-                    10: tx_data.d = 8h0A // LF
-                        
-                        
-                    /*
-                     * Defensive fallback.
-                     *
-                     * reply_index is only supposed to visit 0..10.
-                     * If something unexpected occurs, transmit '?'.
-                     */                        
+0: tx_data.d = 8h41 // A
+       1: tx_data.d = 8h44 // D
+       2: tx_data.d = 8h44 // D
+       3: tx_data.d = 8h52 // R
+       4: tx_data.d = 8h3D // =
+
+
+       /*
+        * First hexadecimal digit: bits 15..12.
+        *
+        * Numeric values 0..9 become ASCII '0'..'9'.
+        *
+        * Values 10..15 become ASCII 'A'..'F'.
+        */                        
+       5:
+       if (reply_address.q[15:12] < 10)
+           tx_data.d = 8h30 + reply_address.q[15:12]
+       else
+           tx_data.d = 8h37 + reply_address.q[15:12]
+
+
+               /*
+                * Second hexadecimal digit: bits 11..8.
+                */                        
+               6:
+               if (reply_address.q[11:8] < 10)
+                   tx_data.d = 8h30 + reply_address.q[11:8]
+               else
+                   tx_data.d = 8h37 + reply_address.q[11:8]
+
+
+                       /*
+                        * Third hexadecimal digit: bits 7..4.
+                        */                        
+                       7:
+                       if (reply_address.q[7:4] < 10)
+                           tx_data.d = 8h30 + reply_address.q[7:4]
+                       else
+                           tx_data.d = 8h37 + reply_address.q[7:4]
+
+
+                               /*
+                                * Fourth hexadecimal digit: bits 3..0.
+                                */                        
+                               8:
+                               if (reply_address.q[3:0] < 10)
+                                   tx_data.d = 8h30 + reply_address.q[3:0]
+                               else
+                                   tx_data.d = 8h37 + reply_address.q[3:0]
+
+
+                               /*
+                                * Append the fixed text " MAP=".
+                                */
+                               9:  tx_data.d = 8h20 // space
+                               10: tx_data.d = 8h4D // M
+                               11: tx_data.d = 8h41 // A
+                               12: tx_data.d = 8h50 // P
+                               13: tx_data.d = 8h3D // =
+
+                               /*
+                                * Fixed-width five-character memory-map name.
+                                *
+                                * This intentionally mirrors the BR2 chip-select ranges and
+                                * uses reply_address.q, the frozen address being printed.
+                                *
+                                *     RAM__  -> 0x0000..0x1FFF
+                                *     ACIA_  -> 0x6000..0x6FFF
+                                *     UARTB  -> 0x7000..0x7FFF
+                                *     ROM__  -> 0x8000..0xFFFF
+                                *     NONE_  -> all other addresses
+                                *
+                                * Underscores above represent transmitted spaces.
+                                */
+                               14:
+                               if (reply_address.q[15] == 1)
+                                   tx_data.d = 8h52 // R in ROM
+                               else if (reply_address.q[15:13] == 3b000)
+                                   tx_data.d = 8h52 // R in RAM
+                               else if (reply_address.q[15:12] == 4h7)
+                                   tx_data.d = 8h55 // U in UARTB
+                               else if (reply_address.q[15:12] == 4h6)
+                                   tx_data.d = 8h41 // A in ACIA
+                               else
+                                   tx_data.d = 8h4E // N in NONE
+
+                               15:
+                               if (reply_address.q[15] == 1)
+                                   tx_data.d = 8h4F // O in ROM
+                               else if (reply_address.q[15:13] == 3b000)
+                                   tx_data.d = 8h41 // A in RAM
+                               else if (reply_address.q[15:12] == 4h7)
+                                   tx_data.d = 8h41 // A in UARTB
+                               else if (reply_address.q[15:12] == 4h6)
+                                   tx_data.d = 8h43 // C in ACIA
+                               else
+                                   tx_data.d = 8h4F // O in NONE
+
+                               16:
+                               if (reply_address.q[15] == 1)
+                                   tx_data.d = 8h4D // M in ROM
+                               else if (reply_address.q[15:13] == 3b000)
+                                   tx_data.d = 8h4D // M in RAM
+                               else if (reply_address.q[15:12] == 4h7)
+                                   tx_data.d = 8h52 // R in UARTB
+                               else if (reply_address.q[15:12] == 4h6)
+                                   tx_data.d = 8h49 // I in ACIA
+                               else
+                                   tx_data.d = 8h4E // N in NONE
+
+                               17:
+                               if (reply_address.q[15] == 1)
+                                   tx_data.d = 8h20 // pad ROM
+                               else if (reply_address.q[15:13] == 3b000)
+                                   tx_data.d = 8h20 // pad RAM
+                               else if (reply_address.q[15:12] == 4h7)
+                                   tx_data.d = 8h54 // T in UARTB
+                               else if (reply_address.q[15:12] == 4h6)
+                                   tx_data.d = 8h41 // A in ACIA
+                               else
+                                   tx_data.d = 8h45 // E in NONE
+
+                               18:
+                               if (reply_address.q[15] == 1)
+                                   tx_data.d = 8h20 // pad ROM
+                               else if (reply_address.q[15:13] == 3b000)
+                                   tx_data.d = 8h20 // pad RAM
+                               else if (reply_address.q[15:12] == 4h7)
+                                   tx_data.d = 8h42 // B in UARTB
+                               else
+                                   tx_data.d = 8h20 // pad ACIA/NONE
+
+                               /* Finish the fixed-length reply with CR/LF. */
+                               19: tx_data.d = 8h0D // CR
+                               20: tx_data.d = 8h0A // LF
+
+                               /*
+                                * Defensive fallback. Valid indices are 0..20.
+                                */
                     default: tx_data.d = 8h3F // ?
                 }
-                
-                
+
+
                 /*
                  * Queue the byte we just prepared.
                  */                
                 tx_pending.d = 1
-                
-                
-                /*
-                 * If LF was just prepared, the reply is finished.
-                 */                
-                if (reply_index.q == 10) {
-                    reply_pending.d = 0
-                    
-                /*
-                 * Otherwise advance to the next reply character.
-                 */                    
-                } else {
-                    reply_index.d = reply_index.q + 1
-                }
+
+
+                    /*
+                     * If LF was just prepared, the fixed-length reply is finished.
+                     */                
+                    if (reply_index.q == 20) {
+                        reply_pending.d = 0
+
+                            /*
+                             * Otherwise advance to the next reply character.
+                             */                    
+                    } else {
+                        reply_index.d = reply_index.q + 1
+                    }
             }
-        }
-        
-        
-        /*
-         * ---------------------------------------------------------------------
-         * PHYSICAL UART TRANSMIT OUTPUT
-         * ---------------------------------------------------------------------
-         *
-         * Connect the uart_tx module's serialized output bitstream to the
-         * physical FPGA->PC USB serial pin.
-         */        
-        usb_tx = tx.tx
     }
+
+
+    /*
+     * ---------------------------------------------------------------------
+     * PHYSICAL UART TRANSMIT OUTPUT
+     * ---------------------------------------------------------------------
+     *
+     * Connect the uart_tx module's serialized output bitstream to the
+     * physical FPGA->PC USB serial pin.
+     */        
+    usb_tx = tx.tx
+}
 }
