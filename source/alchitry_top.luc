@@ -264,7 +264,12 @@ module alchitry_top (
                  * Decimal point is handled separately.
                  */    
                 sig display_segments[7]
-
+                
+                /*
+                * Memory Map decoder : gnerates active-low ROM, RAM
+                * UART-B and ACIA chip selects
+                */
+                memory_decoder mem
 
                 /*
                  * =========================================================================
@@ -541,6 +546,8 @@ always {
 
         br_1hz = heartbeat_output.q
 
+        mem.address = address.q
+
         /*
          * ---------------------------------------------------------------------
          * MEMORY-MAP CHIP SELECTS
@@ -553,30 +560,12 @@ always {
          * Every output first receives a safe inactive default. The address
          * comparisons below then assert only the matching region.
          */
-        br_rom_cs_n = 1
-        br_ram_cs_n = 1
-        br_uartb_cs_n = 1
-        br_acia_cs_n = 1
+        br_rom_cs_n = mem.rom_cs_n
+        br_ram_cs_n = mem.ram_cs_n
+        br_uartb_cs_n = mem.uartb_cs_n
+        br_acia_cs_n = mem.acia_cs_n
 
-        /* ROM: 0x8000 through 0xFFFF. */
-        if (address.q[15] == 1) {
-            br_rom_cs_n = 0
-        }
 
-        /* RAM: 0x0000 through 0x1FFF. */
-        if (address.q[15:13] == 3b000) {
-            br_ram_cs_n = 0
-        }
-
-        /* UART-B: 0x7000 through 0x7FFF. */
-        if (address.q[15:12] == 4h7) {
-            br_uartb_cs_n = 0
-        }
-
-        /* ACIA: 0x6000 through 0x6FFF. */
-        if (address.q[15:12] == 4h6) {
-            br_acia_cs_n = 0
-        }
 
     /*
      * ---------------------------------------------------------------------

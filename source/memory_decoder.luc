@@ -1,0 +1,38 @@
+module memory_decoder (
+    input address[16],
+
+    output rom_cs_n,
+    output ram_cs_n,
+    output uartb_cs_n,
+    output acia_cs_n
+) {
+
+    always {
+         rom_cs_n = 1
+        ram_cs_n = 1
+        uartb_cs_n = 1
+        acia_cs_n = 1
+
+        //rom decode
+        if (address[15] == 1) {
+            rom_cs_n = 0
+        }
+
+        //ram decode
+        if (address[15:13] == 3b000) {
+            ram_cs_n = 0
+        }
+
+        //UART-B decode
+        if(address[15:12] == 4h7) {
+            uartb_cs_n = 0
+        }
+
+        // ACIA
+        if(address[15:12] == 4h6){
+            acia_cs_n = 0
+        }
+}
+}
+
+
